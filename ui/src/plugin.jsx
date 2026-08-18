@@ -44,7 +44,13 @@ export function register(host) {
   function formatExpiry(expiresAt) {
     if (!expiresAt) return null;
     const deltaS = expiresAt - Date.now() / 1000;
-    if (deltaS <= 0) return { text: 'expired', danger: true };
+    if (deltaS <= 0) {
+      const days = Math.floor(-deltaS / 86400);
+      if (days >= 1) return { text: `expired ${days}d ago`, danger: true };
+      const hours = Math.floor(-deltaS / 3600);
+      if (hours >= 1) return { text: `expired ${hours}h ago`, danger: true };
+      return { text: 'expired', danger: true };
+    }
     const hours = deltaS / 3600;
     if (hours < 1) return { text: `expires in ${Math.round(deltaS / 60)}m`, danger: true };
     if (hours < 6) return { text: `expires in ${hours.toFixed(1)}h`, danger: true };
@@ -114,12 +120,22 @@ export function register(host) {
         {expanded && (
           <div className="px-3 pb-3">
             <div className="text-[11px] text-[var(--color-text-muted)] mb-2">
-              Paste a fresh bearer token from a logged-in{' '}
-              <code className="bg-white/10 px-1 rounded">web.plaud.ai</code> browser session
-              (DevTools → Network → any <code className="bg-white/10 px-1 rounded">api.plaud.ai</code> request
-              → <code className="bg-white/10 px-1 rounded">authorization</code> header). It's a short-lived
-              token (~24h) with no auto-refresh — see the <code className="bg-white/10 px-1 rounded">aw-plaud</code> skill
-              for the full steps.
+              Open{' '}
+              <a
+                href="https://web.plaud.ai"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-[var(--color-accent)] hover:underline"
+              >
+                web.plaud.ai
+              </a>{' '}
+              and log in, then DevTools → Network → any{' '}
+              <code className="bg-white/10 px-1 rounded">api.plaud.ai</code> request →{' '}
+              <code className="bg-white/10 px-1 rounded">authorization</code> header. Paste it below as-is —
+              with or without <code className="bg-white/10 px-1 rounded">Bearer </code>, or the whole header
+              line, both work. It's a short-lived token (~24h) with no auto-refresh — see the{' '}
+              <code className="bg-white/10 px-1 rounded">aw-plaud</code> skill for the full steps. This panel is
+              also reachable from this app's Settings, which is now the canonical place to manage it.
             </div>
             <div className="flex gap-2">
               <input

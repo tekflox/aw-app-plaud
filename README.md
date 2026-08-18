@@ -19,6 +19,13 @@ token refresh — carried over unchanged) plus the paste-a-token form from
   transcribed/summarized badges), an in-window audio player, a download
   button for the original file, and the transcript (timestamped) and AI
   summary rendered on screen.
+- **Settings → Plaud** — the canonical place to manage the connection: a
+  direct link to `web.plaud.ai`, tolerant paste (bare token, with/without
+  `Bearer `, or the whole `authorization: ...` line copied from DevTools),
+  immediate re-validation on save, and the token's expiry shown right there.
+  The connection panel inside the app window (below) still works as a
+  shortcut to the same field — both save through the same `/settings` route
+  and the same secret, neither duplicates the other's logic.
 - **A connection panel that treats "token expired" as a first-class state**
   — not just a 401 recordings quietly fail on. Shows connected (with the
   account email), expiring soon, or expired, right in the window.
@@ -35,15 +42,20 @@ without exporting them by hand.
 
 ## How To Use It
 
-1. Install the app, open **Apps → Plaud**.
-2. Log into `web.plaud.ai` in a normal browser, open DevTools → Network, click
-   a recording, and copy the `authorization` header value from any
-   `api.plaud.ai` request.
-3. Paste it into the connection panel at the top of the window and Save.
-4. Browse recordings, play/download audio, read transcripts and summaries.
+1. Install the app, open **Settings → Plaud** (or the shortcut inside
+   **Apps → Plaud**).
+2. Follow the link to `web.plaud.ai`, log in, open DevTools → Network, and
+   copy the `authorization` header value from any `api.plaud.ai` request —
+   the whole header line works too, no need to trim it by hand.
+3. Paste it and Save. The panel re-checks the token against Plaud
+   immediately and shows the real result (connected, with the account email,
+   or the actual error) instead of a blind "saved".
+4. Browse recordings, play/download audio, read transcripts and summaries
+   from **Apps → Plaud**.
 
 The token is a short-lived JWT (~24h) with **no refresh flow** — when it
-expires, the connection panel goes red and tells you to re-paste one. See
+expires, both the Settings panel and the in-app connection panel show
+"expired" (with how long ago) and prompt for a fresh paste. See
 `skills/aw-plaud/SKILL.md` for the full obtain/refresh steps and the
 reverse-engineered API shape.
 

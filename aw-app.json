@@ -39,6 +39,15 @@
         "body": {
           "type": "component"
         }
+      },
+      {
+        "id": "plaud.settings",
+        "title": "Plaud",
+        "icon": "mic",
+        "body": {
+          "type": "declarative",
+          "spec": "windows/settings.json"
+        }
       }
     ],
     "frontend": {
@@ -48,6 +57,12 @@
         "core.window.body:plaud.main"
       ]
     },
+    "settings_panels": [
+      {
+        "id": "plaud.settings",
+        "window": "plaud.settings"
+      }
+    ],
     "mcp": {
       "reload_on_save": true,
       "provides": [
@@ -66,18 +81,6 @@
       }
     ]
   },
-  "config_schema": {
-    "type": "object",
-    "properties": {
-      "plaud_bearer_token": {
-        "type": "string",
-        "x-secret": true,
-        "description": "Bearer token lifted from a logged-in web.plaud.ai browser session (DevTools \u2192 Network \u2192 any api.plaud.ai request \u2192 authorization header). Never stored in plain config \u2014 routed to the secret store via POST /api/apps/plaud/settings, same pattern as aw-app-git's github_token and aw-app-notion's notion_token. Short-lived JWT (~24h) with no refresh flow \u2014 re-paste when it expires."
-      }
-    },
-    "required": []
-  },
-  "config_visible": false,
   "dependencies": {
     "apps": [
       {

@@ -1,0 +1,43 @@
+{
+  "title": "Plaud",
+  "regions": [
+    {
+      "id": "status",
+      "widgets": [
+        {
+          "type": "auth_status",
+          "bind": "GET /api/apps/plaud/status",
+          "logout_action": { "call": "POST /api/apps/plaud/logout" },
+          "loading_text": "Checking Plaud connection…",
+          "logged_in_text": "Connected — {email} · {expires_in_text}",
+          "error_text": "{error}",
+          "logged_out_text": "Not connected — paste a token below to get started."
+        }
+      ]
+    },
+    {
+      "id": "setup",
+      "widgets": [
+        {
+          "type": "markdown",
+          "value": "### Get a fresh token\n1. Open **[web.plaud.ai](https://web.plaud.ai)** in a new tab and make sure you're logged in.\n2. Open DevTools → Network, click any request to `api.plaud.ai`, and copy its `authorization` request header.\n3. Paste it below — with or without the `Bearer ` prefix, or the whole `authorization: eyJ...` line copied straight from DevTools, all work.\n\nThe token is a short-lived JWT (~24h) with no refresh flow, so you'll repeat this roughly once a day — see the `aw-plaud` skill for the full steps and the email+password login flow being considered as a next step."
+        },
+        {
+          "type": "form",
+          "id": "plaud_settings",
+          "submit": { "call": "POST /api/apps/plaud/settings" },
+          "submit_label": "Save",
+          "fields": [
+            {
+              "key": "plaud_bearer_token",
+              "label": "Plaud bearer token",
+              "input": "password",
+              "placeholder": "eyJ… or authorization: eyJ…",
+              "description": "Stored in the zero-knowledge secret store, never in plain config. Saving re-checks the token against Plaud right away — the status line above updates with the real result."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

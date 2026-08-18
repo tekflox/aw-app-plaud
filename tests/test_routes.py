@@ -6,9 +6,11 @@ Run: .venv/aw/bin/python -m pytest tests/test_routes.py
 """
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -17,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from plaud_app import mcp_config, routes  # noqa: E402
-from plaud_app.client import PlaudClient  # noqa: E402
+from plaud_app.client import PlaudClient, PlaudError  # noqa: E402
 
 
 class FakeSecrets:
@@ -52,6 +54,13 @@ def _client(tmp_path):
     return TestClient(routes.build_routes(ctx)), ctx
 
 
+def _fake_jwt(exp: float | None) -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    payload_obj = {"exp": exp} if exp is not None else {}
+    payload = base64.urlsafe_b64encode(json.dumps(payload_obj).encode()).rstrip(b"=").decode()
+    return f"{header}.{payload}.sig"
+
+
 def test_status_without_token_makes_no_network_call():
     with tempfile.TemporaryDirectory() as tmp:
         client, _ctx = _client(Path(tmp))
@@ -62,6 +71,7 @@ def test_status_without_token_makes_no_network_call():
         assert body["logged_in"] is False
         assert body["expired"] is False
         assert body["mcp_server_enabled"] is False
+        assert body["expires_in_text"] is None
 
 
 def test_save_settings_writes_secret_and_mcp_json():
@@ -90,6 +100,46 @@ def test_save_settings_rejects_empty_token():
         resp = client.post("/settings", json={"plaud_bearer_token": "  "})
         assert resp.status_code == 400
         assert "error" in resp.json()
+
+
+def test_save_settings_normalizes_bearer_prefix_and_whitespace():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, ctx = _client(Path(tmp))
+        resp = client.post("/settings", json={"plaud_bearer_token": "  Bearer eyTest.token.here  "})
+        assert resp.status_code == 200
+        assert ctx.secrets.read("plaud_bearer_token") == "eyTest.token.here"
+
+
+def test_save_settings_normalizes_a_whole_pasted_header_line():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, ctx = _client(Path(tmp))
+        resp = client.post("/settings", json={"plaud_bearer_token": "authorization: Bearer eyTest.token.here"})
+        assert resp.status_code == 200
+        assert ctx.secrets.read("plaud_bearer_token") == "eyTest.token.here"
+
+
+def test_save_settings_rejects_a_header_line_with_nothing_after_the_colon():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _ctx = _client(Path(tmp))
+        resp = client.post("/settings", json={"plaud_bearer_token": "authorization:  "})
+        assert resp.status_code == 400
+
+
+def test_status_reports_expiry_text_after_saving_an_expiring_token(monkeypatch):
+    # status() calls out to Plaud (client.status() -> /user/me) to check
+    # validity; expires_in_text only needs the token's own exp claim, which
+    # is computed before that call and survives it failing — mock the call
+    # itself to failure so this test makes no real network request.
+    def _raise(self, path, *, timeout=20.0):
+        raise PlaudError("network unavailable in test")
+    monkeypatch.setattr(PlaudClient, "_get_json", _raise)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _ctx = _client(Path(tmp))
+        token = _fake_jwt(time.time() + 3600 * 10)
+        client.post("/settings", json={"plaud_bearer_token": token})
+        resp = client.get("/status")
+        assert resp.json()["expires_in_text"] == "expires in 10h"
 
 
 def test_logout_clears_secret_and_disables_mcp_server():

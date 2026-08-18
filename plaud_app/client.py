@@ -54,6 +54,47 @@ class PlaudError(RuntimeError):
         self.expired = expired
 
 
+def normalize_pasted_token(raw: str | None) -> str:
+    """Tolerant cleanup for a token pasted straight out of DevTools — accepts
+    the bare JWT, one with a `Bearer ` scheme prefix, surrounding whitespace,
+    or the whole `authorization: eyJ...` request-header line DevTools' own
+    "Copy value" produces, and returns the bare token in every case. A JWT's
+    base64url alphabet never contains ``:``, so splitting on the first colon
+    to find a header name is safe."""
+    tok = (raw or "").strip()
+    if ":" in tok:
+        head, _, rest = tok.partition(":")
+        if head.strip().lower() == "authorization":
+            tok = rest.strip()
+    if tok.lower().startswith("bearer "):
+        tok = tok[len("bearer "):].strip()
+    return tok
+
+
+def format_expiry_text(expires_at: float | None) -> str | None:
+    """Human-readable "expires in Xh" / "expired Xd ago" string for a JWT's
+    ``exp`` claim — computed server-side so the declarative settings window's
+    ``auth_status`` widget (plain string interpolation, no date math) can show
+    it without the client-side JS the component window already has."""
+    if expires_at is None:
+        return None
+    delta = expires_at - time.time()
+    if delta <= 0:
+        days = int(-delta // 86400)
+        if days >= 1:
+            return f"expired {days}d ago"
+        hours = int(-delta // 3600)
+        if hours >= 1:
+            return f"expired {hours}h ago"
+        return "expired"
+    hours = delta / 3600
+    if hours < 1:
+        return f"expires in {round(delta / 60)}m"
+    if hours < 6:
+        return f"expires in {hours:.1f}h"
+    return f"expires in {round(hours)}h"
+
+
 def decode_token_exp(token: str) -> float | None:
     """Best-effort, unverified parse of a JWT's ``exp`` claim (seconds since
     epoch). Returns ``None`` for anything that doesn't look like a JWT with

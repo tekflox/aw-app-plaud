@@ -22,7 +22,7 @@ from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import mcp_config
-from .client import PlaudClient, PlaudError
+from .client import PlaudClient, PlaudError, format_expiry_text, normalize_pasted_token
 
 log = logging.getLogger("aw_apps.plaud.routes")
 
@@ -40,6 +40,7 @@ def _status_payload(client: PlaudClient, doc_servers: dict) -> dict:
         "expired": st.expired,
         "email": st.email,
         "expires_at": st.expires_at,
+        "expires_in_text": format_expiry_text(st.expires_at),
         "error": st.error,
         "mcp_server_enabled": bool(doc_servers),
     }
@@ -73,8 +74,12 @@ def build_routes(ctx) -> FastAPI:
         """Stores the token and regenerates mcp.json. Deliberately does NOT
         call out to Plaud here — that's what GET /status is for, and the UI
         calls it right after saving. Keeps this route fast and independent
-        of Plaud being reachable."""
-        token = (data.get(TOKEN_KEY) or "").strip()
+        of Plaud being reachable.
+
+        Accepts whatever shape DevTools' "Copy value" actually produces —
+        see ``normalize_pasted_token``: with/without ``Bearer ``, surrounding
+        whitespace, or the whole ``authorization: eyJ...`` header line."""
+        token = normalize_pasted_token(data.get(TOKEN_KEY))
         if not token:
             return JSONResponse({"error": f"{TOKEN_KEY} is required"}, status_code=400)
         ctx.secrets.write(TOKEN_KEY, token)

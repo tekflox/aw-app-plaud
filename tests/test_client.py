@@ -16,7 +16,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import plaud_app.client as client_module
-from plaud_app.client import PlaudClient, PlaudError, decode_token_exp  # noqa: E402
+from plaud_app.client import (  # noqa: E402
+    PlaudClient,
+    PlaudError,
+    decode_token_exp,
+    format_expiry_text,
+    normalize_pasted_token,
+)
 
 
 class _FakeResponse:
@@ -119,3 +125,51 @@ def test_status_reports_valid_for_a_genuinely_fresh_token(monkeypatch):
     assert st.valid is True
     assert st.expired is False
     assert st.email == "a@b.com"
+
+
+def test_normalize_pasted_token_strips_whitespace():
+    assert normalize_pasted_token("  eyJ.abc.def  ") == "eyJ.abc.def"
+
+
+def test_normalize_pasted_token_strips_bearer_prefix():
+    assert normalize_pasted_token("Bearer eyJ.abc.def") == "eyJ.abc.def"
+    assert normalize_pasted_token("bearer   eyJ.abc.def") == "eyJ.abc.def"
+
+
+def test_normalize_pasted_token_strips_authorization_header_line():
+    assert normalize_pasted_token("authorization: eyJ.abc.def") == "eyJ.abc.def"
+    assert normalize_pasted_token("Authorization : Bearer eyJ.abc.def") == "eyJ.abc.def"
+
+
+def test_normalize_pasted_token_handles_bare_token_unchanged():
+    assert normalize_pasted_token("eyJ.abc.def") == "eyJ.abc.def"
+
+
+def test_normalize_pasted_token_handles_none_and_empty():
+    assert normalize_pasted_token(None) == ""
+    assert normalize_pasted_token("   ") == ""
+
+
+def test_format_expiry_text_none_when_no_claim():
+    assert format_expiry_text(None) is None
+
+
+def test_format_expiry_text_future_hours():
+    assert format_expiry_text(time.time() + 3600 * 10) == "expires in 10h"
+
+
+def test_format_expiry_text_future_minutes():
+    text = format_expiry_text(time.time() + 300)
+    assert text.startswith("expires in") and text.endswith("m")
+
+
+def test_format_expiry_text_expired_days_ago():
+    assert format_expiry_text(time.time() - 86400 * 3) == "expired 3d ago"
+
+
+def test_format_expiry_text_expired_hours_ago():
+    assert format_expiry_text(time.time() - 3600 * 5) == "expired 5h ago"
+
+
+def test_format_expiry_text_just_expired():
+    assert format_expiry_text(time.time() - 1) == "expired"
