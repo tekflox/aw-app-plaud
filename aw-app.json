@@ -1,9 +1,10 @@
 {
   "manifest_version": 1,
-  "id": "aw-app-template",
-  "name": "App Template",
-  "version": "0.12.2",
-  "description": "TEMPLATE \u2014 the fastest way to start a new aw-workspace app. Install it and you have a working app on day one: a `hello` CLI that prints a configurable greeting, its own window in the Apps grid, and an HTTP + WebSocket backend \u2014 with tests and marketplace release already wired. Rename everything marked TEMPLATE/hello to make it yours; see README.md.",
+  "id": "plaud",
+  "name": "Plaud",
+  "version": "0.1.0",
+  "description": "Browse your Plaud AI recorder notes without leaving the workspace: see every recording, play or download the original audio, and read the transcript and AI summary — plus the 5 aw-plaud MCP tools an agent can use to pull the same data.",
+  "icon": "mic",
   "tier": "inprocess",
   "requires_ui_refresh": true,
   "publisher": "TekFlox",
@@ -14,57 +15,78 @@
   },
   "runtime": {
     "python": ">=3.11",
-    "entrypoint": "template_app.plugin:HelloAppPlugin",
-    "pip_requires": [],
-    "standalone": {
-      "module": "template_app",
-      "default_port": 9400
-    }
+    "entrypoint": "plaud_app.plugin:PlaudAppPlugin",
+    "pip_requires": [
+      "httpx>=0.24"
+    ]
   },
   "permissions": [
-    "commands:install",
-    "fs:workspace-data",
     "routes:register",
-    "ui:code",
-    "ui:slots:core.nav"
+    "secrets:own",
+    "ui:code"
   ],
   "contributes": {
-    "system_clis": [
-      {
-        "name": "hello",
-        "installer": "scripts/install_hello.sh",
-        "verify": "hello --version"
-      }
-    ],
     "routes": [
       {
-        "prefix": "/api/apps/aw-app-template"
+        "prefix": "/api/apps/plaud"
+      }
+    ],
+    "windows": [
+      {
+        "id": "plaud.main",
+        "title": "Plaud",
+        "icon": "mic",
+        "body": {
+          "type": "component"
+        }
       }
     ],
     "frontend": {
       "mode": "component",
-      "bundle": "ui/dist/template.js"
+      "bundle": "ui/dist/plaud-ui.mjs",
+      "slots": [
+        "core.window.body:plaud.main"
+      ]
+    },
+    "mcp": {
+      "reload_on_save": true,
+      "provides": [
+        "plaud_status",
+        "plaud_list_recordings",
+        "plaud_get_transcript",
+        "plaud_get_summary",
+        "plaud_download_audio"
+      ]
     },
     "skills": [
       {
-        "id": "aw-create-app",
-        "path": "skills/aw-create-app/SKILL.md",
-        "description": "How to author a decoupled aw-workspace app from this template \u2014 manifest, tiers, capabilities, contributes, backend routes (HTTP+WS), frontend code, standalone mode, window widgets, install + marketplace release."
+        "id": "aw-plaud",
+        "path": "skills/aw-plaud/SKILL.md",
+        "description": "Personal Plaud account connector — tool reference, the Apps › Plaud UI, how to obtain/refresh the bearer token, and known limitations."
       }
     ]
   },
   "config_schema": {
     "type": "object",
     "properties": {
-      "greeting": {
+      "plaud_bearer_token": {
         "type": "string",
-        "default": "Hello",
-        "description": "Word the installed `hello` command prints before the target name, e.g. \"Hello, world!\"."
+        "x-secret": true,
+        "description": "Bearer token lifted from a logged-in web.plaud.ai browser session (DevTools → Network → any api.plaud.ai request → authorization header). Never stored in plain config — routed to the secret store via POST /api/apps/plaud/settings, same pattern as aw-app-git's github_token and aw-app-notion's notion_token. Short-lived JWT (~24h) with no refresh flow — re-paste when it expires."
       }
     },
     "required": []
   },
   "config_visible": false,
-  "dependencies": {},
+  "dependencies": {
+    "apps": [
+      {
+        "id": "mcp-gateway",
+        "version": ">=0.1.0",
+        "required": true,
+        "reason": "This app contributes its own mcp.json (the aw-plaud server) that MCP Gateway discovers and merges."
+      }
+    ]
+  },
   "migrations": {}
 }
