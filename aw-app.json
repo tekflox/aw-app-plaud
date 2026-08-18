@@ -2,8 +2,8 @@
   "manifest_version": 1,
   "id": "plaud",
   "name": "Plaud",
-  "version": "0.1.0",
-  "description": "Browse your Plaud AI recorder notes without leaving the workspace: see every recording, play or download the original audio, and read the transcript and AI summary — plus the 5 aw-plaud MCP tools an agent can use to pull the same data.",
+  "version": "0.2.0",
+  "description": "Browse your Plaud AI recorder notes without leaving the workspace: see every recording, play or download the original audio, and read the transcript and AI summary \u2014 plus the 5 aw-plaud MCP tools an agent can use to pull the same data.",
   "icon": "mic",
   "tier": "inprocess",
   "requires_ui_refresh": true,
@@ -62,7 +62,7 @@
       {
         "id": "aw-plaud",
         "path": "skills/aw-plaud/SKILL.md",
-        "description": "Personal Plaud account connector — tool reference, the Apps › Plaud UI, how to obtain/refresh the bearer token, and known limitations."
+        "description": "Personal Plaud account connector \u2014 tool reference, the Apps \u203a Plaud UI, how to obtain/refresh the bearer token, and known limitations."
       }
     ]
   },
@@ -72,7 +72,7 @@
       "plaud_bearer_token": {
         "type": "string",
         "x-secret": true,
-        "description": "Bearer token lifted from a logged-in web.plaud.ai browser session (DevTools → Network → any api.plaud.ai request → authorization header). Never stored in plain config — routed to the secret store via POST /api/apps/plaud/settings, same pattern as aw-app-git's github_token and aw-app-notion's notion_token. Short-lived JWT (~24h) with no refresh flow — re-paste when it expires."
+        "description": "Bearer token lifted from a logged-in web.plaud.ai browser session (DevTools \u2192 Network \u2192 any api.plaud.ai request \u2192 authorization header). Never stored in plain config \u2014 routed to the secret store via POST /api/apps/plaud/settings, same pattern as aw-app-git's github_token and aw-app-notion's notion_token. Short-lived JWT (~24h) with no refresh flow \u2014 re-paste when it expires."
       }
     },
     "required": []
