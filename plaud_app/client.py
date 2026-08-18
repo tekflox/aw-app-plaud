@@ -128,9 +128,22 @@ class PlaudClient:
         if resp.status_code >= 400:
             raise PlaudError(f"Plaud API {resp.status_code}: {resp.text[:300]}", status=resp.status_code)
         try:
-            return resp.json()
+            data = resp.json()
         except Exception as exc:
             raise PlaudError(f"Plaud API returned non-JSON: {exc}") from exc
+        # Plaud's unofficial API answers HTTP 200 even for a dead session —
+        # the real error lives in the JSON body (observed: `{"status":-419,
+        # "msg":"workspace token expired"}`). Checking the HTTP status alone
+        # reads that as success, so a negative body `status` is an error too.
+        body_status = data.get("status") if isinstance(data, dict) else None
+        if isinstance(body_status, (int, float)) and body_status < 0:
+            msg = (data.get("msg") or "").strip() or f"Plaud API error {body_status}"
+            expired = body_status == -419 or "expired" in msg.lower()
+            raise PlaudError(
+                f"Plaud API error in response body: {msg} (status {body_status})",
+                status=401 if expired else 502, expired=expired,
+            )
+        return data
 
     # ── status ──────────────────────────────────────────────────────────
 
@@ -147,6 +160,15 @@ class PlaudClient:
             return TokenStatus(
                 configured=True, valid=False, expired=exc.expired or expired_by_claim,
                 email=None, expires_at=expires_at, error=str(exc),
+            )
+        if expired_by_claim:
+            # The API call itself "succeeded", but the token's own exp claim
+            # is already in the past — never report valid on the strength of
+            # a call that a stale/inconsistent Plaud session let through.
+            return TokenStatus(
+                configured=True, valid=False, expired=True,
+                email=None, expires_at=expires_at,
+                error="Token's exp claim is in the past, even though the API call returned data.",
             )
         user = data.get("data_user") or {}
         email = user.get("email") or user.get("nickname")
