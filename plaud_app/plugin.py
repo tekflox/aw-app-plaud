@@ -32,7 +32,7 @@ log = logging.getLogger("aw_apps.plaud")
 class PlaudAppPlugin:
     async def activate(self, ctx) -> None:
         self._ctx = ctx
-        token = ctx.secrets.read(routes_mod.TOKEN_KEY)
+        token = routes_mod._mcp_gate_token(ctx)
         doc = self._write_mcp_json(ctx, token)
 
         ctx.routes.register(routes_mod.build_routes(ctx))

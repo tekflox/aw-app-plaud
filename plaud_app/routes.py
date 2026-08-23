@@ -19,9 +19,9 @@ from __future__ import annotations
 import logging
 
 from fastapi import Body, FastAPI
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
-from . import mcp_config
+from . import mcp_config, oauth
 from .client import PlaudClient, PlaudError, format_expiry_text, normalize_pasted_token
 
 log = logging.getLogger("aw_apps.plaud.routes")
@@ -29,29 +29,73 @@ log = logging.getLogger("aw_apps.plaud.routes")
 TOKEN_KEY = "plaud_bearer_token"
 
 
-def _status_payload(client: PlaudClient, doc_servers: dict) -> dict:
+def _oauth_error_text(ctx) -> str | None:
+    """The one sentence the settings panel's `error_text` shows for
+    whichever non-happy OAuth state currently applies, checked in priority
+    order. `None` means OAuth has nothing to report right now (either fully
+    connected, or never touched at all)."""
+    missing = oauth.missing_config(ctx)
+    if missing:
+        return f"OAuth not configured — missing: {', '.join(missing)}."
+    if oauth.is_connected(ctx):
+        _token, error = oauth.get_valid_access_token(ctx)
+        if error:
+            return f"Token expired and refresh failed: {error}. Reconnect below."
+    return None
+
+
+def _status_payload(ctx, client: PlaudClient, doc_servers: dict) -> dict:
     st = client.status()
+    oauth_connected = oauth.is_connected(ctx)
+    bearer_present = bool(ctx.secrets.read(TOKEN_KEY))
+    auth_method = "oauth" if oauth_connected else ("bearer" if bearer_present else None)
+    oauth_missing = oauth.missing_config(ctx)
+    error = st.error if (bearer_present and not oauth_connected) else _oauth_error_text(ctx)
+    # An OAuth access token has no reason to be a JWT (could be opaque), so
+    # PlaudClient.status()'s exp-claim-derived expires_at doesn't apply to
+    # it — use the expiry oauth.py tracked from the token response instead.
+    expires_at = oauth.token_expiry(ctx) if oauth_connected else st.expires_at
     return {
         # "logged_in" is what a status-bound widget would look for;
         # "configured" is the same value under the name every other caller
-        # (tests, /mcp.json) expects.
+        # (tests, /mcp.json) expects. `oauth_missing` being non-empty also
+        # counts as "configured" — there is something the panel needs to
+        # say (which credentials are missing) even before anything has
+        # ever been connected.
         "logged_in": bool(st.valid),
-        "configured": st.configured,
+        "configured": st.configured or bool(oauth_missing),
         "expired": st.expired,
         "email": st.email,
-        "expires_at": st.expires_at,
-        "expires_in_text": format_expiry_text(st.expires_at),
-        "error": st.error,
+        "expires_at": expires_at,
+        "expires_in_text": format_expiry_text(expires_at),
+        "error": error,
+        "auth_method": auth_method,
+        "oauth_configured": not oauth_missing,
+        "oauth_missing": oauth_missing,
         "mcp_server_enabled": bool(doc_servers),
     }
+
+
+def _mcp_gate_token(ctx) -> str | None:
+    """Whatever truthy sentinel gates `mcp_config.write_mcp_json` — the
+    string's *content* is never used (this app's mcp.json entry always
+    points at its own already-authenticated /mcp route, see
+    mcp/self_register.py), only its presence. OAuth being the connected
+    method still has to enable the MCP server exactly like a pasted bearer
+    token always did."""
+    bearer = ctx.secrets.read(TOKEN_KEY)
+    if bearer:
+        return bearer
+    return "oauth-connected" if oauth.is_connected(ctx) else None
 
 
 def build_routes(ctx) -> FastAPI:
     app = FastAPI(title="plaud")
 
     # Resolved per call, never snapshotted: a token saved (or cleared) at
-    # runtime has to take effect without a restart.
-    client = PlaudClient(lambda: ctx.secrets.read(TOKEN_KEY))
+    # runtime has to take effect without a restart. OAuth first (refreshed
+    # transparently), the pasted bearer token as a fallback — see oauth.py.
+    client = PlaudClient(oauth.make_token_getter(ctx, lambda: ctx.secrets.read(TOKEN_KEY)))
 
     def _guard(fn, *args, **kwargs):
         """Run a Plaud API call, turning a PlaudError into its real HTTP
@@ -66,8 +110,7 @@ def build_routes(ctx) -> FastAPI:
 
     @app.get("/status")
     async def status() -> dict:
-        token = ctx.secrets.read(TOKEN_KEY)
-        return _status_payload(client, mcp_config.build_mcp_servers(token))
+        return _status_payload(ctx, client, mcp_config.build_mcp_servers(_mcp_gate_token(ctx)))
 
     @app.post("/settings")
     async def save_settings(data: dict = Body(...)) -> dict:
@@ -89,14 +132,61 @@ def build_routes(ctx) -> FastAPI:
 
     @app.post("/logout")
     async def clear_token() -> dict:
+        """Disconnects BOTH auth methods — whichever is active, "Logout"
+        means fully disconnected, not "disconnect only the one you happened
+        to use last"."""
         ctx.secrets.delete(TOKEN_KEY)
+        oauth.disconnect(ctx)
         mcp_config.write_mcp_json(ctx.package_dir, None)
         return {"ok": True, "logged_in": False, "configured": False}
 
     @app.get("/mcp.json")
     async def mcp_json() -> dict:
-        token = ctx.secrets.read(TOKEN_KEY)
-        return {"mcpServers": mcp_config.build_mcp_servers(token)}
+        return {"mcpServers": mcp_config.build_mcp_servers(_mcp_gate_token(ctx))}
+
+    # ------------------------------------------------------------------
+    # OAuth — see oauth.py's module docstring for why plaud_oauth_
+    # authorize_url / plaud_oauth_token_url are config, not constants.
+    # ------------------------------------------------------------------
+
+    @app.get("/oauth/start")
+    async def oauth_start():
+        """A real browser navigation target (the settings panel's markdown
+        "Connect" link points straight here — see windows/settings.json),
+        not a fetch(): on success this redirects the browser to Plaud, on
+        failure it renders the reason in the same tab in plain text."""
+        try:
+            authorize_url = oauth.start_authorization(ctx)
+        except oauth.OAuthError as exc:
+            return Response(content=str(exc), status_code=400, media_type="text/plain")
+        return RedirectResponse(authorize_url, status_code=302)
+
+    @app.get("/oauth/callback")
+    async def oauth_callback(code: str | None = None, state: str | None = None,
+                             error: str | None = None, error_description: str | None = None):
+        """Plaud redirects the browser here after the user authorizes (or
+        declines). Renders a plain HTML page — this tab has no SPA loaded,
+        it's a fresh top-level navigation to this app's own backend."""
+        try:
+            oauth.handle_callback(ctx, code=code, state=state,
+                                  error=error, error_description=error_description)
+        except oauth.OAuthError as exc:
+            return HTMLResponse(
+                f"<p>Could not connect Plaud: {exc}</p>"
+                f"<p>You can close this tab and try again from Settings.</p>",
+                status_code=400,
+            )
+        mcp_config.write_mcp_json(ctx.package_dir, _mcp_gate_token(ctx))
+        return HTMLResponse(
+            "<p>Connected to Plaud.</p><p>You can close this tab.</p>"
+            "<script>try { window.close(); } catch (e) {}</script>"
+        )
+
+    @app.post("/oauth/disconnect")
+    async def oauth_disconnect() -> dict:
+        oauth.disconnect(ctx)
+        mcp_config.write_mcp_json(ctx.package_dir, _mcp_gate_token(ctx))
+        return {"ok": True}
 
     # ------------------------------------------------------------------
     # Recordings — the UI's data surface. Not a REST mirror of the MCP

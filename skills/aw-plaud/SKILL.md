@@ -15,21 +15,54 @@ Live exploration back then confirmed the (unofficial) endpoints work
 end-to-end: list → detail → transcript (S3, gzip) → summary (S3, gzip) →
 raw audio download.
 
-## Why unofficial
+## Why unofficial (the pasted-bearer path, still the fallback)
 
-Plaud's real developer platform (`dev.plaud.ai` / `docs.plaud.ai`) exists but:
+Plaud's real developer platform (`dev.plaud.ai` / `docs.plaud.ai`) exists but
+is two separate products, easy to conflate:
 
-- **Plaud Embedded** (the public part) is upload-and-transcribe only — no
-  endpoint to fetch *existing* recordings.
-- **Plaud OAuth API** (the one that would fetch existing notes/transcripts,
-  read-only, scoped per account) is in **private beta** — request access at
-  dev.plaud.ai, no ETA.
+- **Plaud Embedded** (`docs.plaud.ai/plaud-embedded`, GA) — a partner
+  provisions and binds *new* users/devices to their own app
+  (`POST {region}/developer/api/oauth/partner/access-token` with
+  client_id+secret_key, then `.../open/partner/users/access-token` per
+  user). No path from this API to an *existing* personal account's own
+  recordings — it's for building a product on top of Plaud hardware, not
+  connecting an account that already has notes in it.
+- **Plaud OAuth API** (browser consent, an existing user authorizing a
+  third party to read their *own* recordings — the one this app actually
+  needs) is a separate product, still in **private beta**
+  (support.plaud.ai/hc/en-us/articles/56061278749209) — waitlist-only, and
+  per Plaud's own FAQ the endpoint details aren't published even to
+  accepted beta members yet ("provided once the API is available").
 
-Until that beta access lands, `aw-plaud` talks directly to the same
-`api.plaud.ai` REST API the `web.plaud.ai` frontend uses, authenticated with
-a bearer token lifted from a logged-in browser session. This is the same
-approach community projects (`openplaud`, `plaud-toolkit`) use — reverse
-engineered, not supported by Plaud.
+Until that lands, `aw-plaud` talks directly to the same `api.plaud.ai` REST
+API the `web.plaud.ai` frontend uses, authenticated with a bearer token
+lifted from a logged-in browser session. This is the same approach
+community projects (`openplaud`, `plaud-toolkit`) use — reverse engineered,
+not supported by Plaud.
+
+## OAuth (the primary path, once Plaud provides real endpoints)
+
+`aw-app-plaud` is itself an OAuth client (`plaud_app/oauth.py`):
+PKCE authorization-code flow, its own public callback
+(`/api/apps/plaud/oauth/callback`, built from `AW_WORKSPACE_API_URL` — no
+`localhost` loopback, which is why the *official* `@plaud-ai/mcp` CLI can't
+be used from inside this workspace at all: its redirect_uri is
+`http://localhost:8199/auth/callback`, a server on the agent container the
+authorizing browser, wherever it is, can never reach), transparent refresh,
+and revocation handling (a failed refresh with `invalid_grant` clears the
+stored tokens instead of retry-looping).
+
+The catch: `plaud_client_id` / `plaud_client_secret` /
+`plaud_oauth_authorize_url` / `plaud_oauth_token_url` (`config_schema` in
+`aw-app.json`, the last two also x-secret-adjacent — see the app itself)
+are **empty by design** — Plaud hasn't published them (see above). The
+Settings panel (Apps → Plaud → Settings, or Settings → Plaud directly)
+shows exactly which of the 4 are missing. Nothing to guess or hardcode:
+once Plaud hands out real values off the OAuth API waitlist, paste them in
+and Connect starts working with no code change.
+
+The pasted-bearer flow below remains the fallback for as long as OAuth
+isn't connected — do not remove it.
 
 ## Tool reference (MCP)
 
@@ -118,16 +151,14 @@ like an auth problem but aren't.
 - No write/import-to-Plaud, no delete, no folder/tag management — read-only
   by design (matches the use case: pull recordings out, work on them
   elsewhere, e.g. import into Notion).
-- **No auto-refresh of the token — this is the real problem, not a
-  cosmetic one.** The JWT lasts ~24h; every day it needs re-pasting or every
-  tool call and the whole UI start 401ing. Two ways out exist and are
-  deliberately NOT implemented yet (see the app's README "Next step"
-  section for the full writeup):
-  1. the unofficial email+password login flow used by `plaud-toolkit`/
-     `openplaud` (~300-day refresh token, separate credential from this
-     short-lived API JWT);
-  2. migrate to the official OAuth API once beta access is granted — check
-     `dev.plaud.ai` account status periodically.
+- **The pasted-bearer path still has no auto-refresh** — the JWT lasts
+  ~24h and needs re-pasting, or every tool call and the whole UI start
+  401ing. This is now the FALLBACK, not the only option: once OAuth
+  (above) is actually connected, refresh is automatic and this limitation
+  no longer applies. Getting there needs Plaud to hand out real
+  `plaud_oauth_authorize_url` / `plaud_oauth_token_url` values off their
+  OAuth API waitlist — check `support.plaud.ai`'s OAuth API FAQ / your
+  waitlist status periodically.
 - The shared Playwright browser (`aw-browser` container, CDP :9223) is
   genuinely multi-tenant — other concurrent sessions can steal/close tabs
   mid-flow. If you need a human to complete an interactive login there

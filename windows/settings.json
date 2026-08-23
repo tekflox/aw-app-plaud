@@ -11,7 +11,17 @@
           "loading_text": "Checking Plaud connection…",
           "logged_in_text": "Connected — {email} · {expires_in_text}",
           "error_text": "{error}",
-          "logged_out_text": "Not connected — paste a token below to get started."
+          "logged_out_text": "Not connected — use Connect below."
+        }
+      ]
+    },
+    {
+      "id": "oauth",
+      "widgets": [
+        {
+          "type": "markdown",
+          "hide_when_logged_in": true,
+          "value": "### Connect\n\n[**Connect with Plaud**](/api/apps/plaud/oauth/start)\n\nOpens in a new tab. You authorize in your own browser — wherever you're already logged into [web.plaud.ai](https://web.plaud.ai) — and this app comes back connected with no token to copy and refresh handled automatically from then on.\n\nIf the message above says OAuth isn't configured yet, that's real: this app is the OAuth client, but it needs `plaud_client_id`/`plaud_client_secret` and the authorize/token endpoint URLs from Plaud's OAuth API first (still private-beta as of 2026-08-23 — see this app's `aw-plaud` skill)."
         }
       ]
     },
@@ -19,21 +29,28 @@
       "id": "setup",
       "widgets": [
         {
-          "type": "markdown",
-          "value": "### Get a fresh token\n1. Open **[web.plaud.ai](https://web.plaud.ai)** in a new tab and make sure you're logged in.\n2. Open DevTools → Network, click any request to `api.plaud.ai`, and copy its `authorization` request header.\n3. Paste it below — with or without the `Bearer ` prefix, or the whole `authorization: eyJ...` line copied straight from DevTools, all work.\n\nThe token is a short-lived JWT (~24h) with no refresh flow, so you'll repeat this roughly once a day — see the `aw-plaud` skill for the full steps and the email+password login flow being considered as a next step."
-        },
-        {
-          "type": "form",
-          "id": "plaud_settings",
-          "submit": { "call": "POST /api/apps/plaud/settings" },
-          "submit_label": "Save",
-          "fields": [
+          "type": "collapsible",
+          "title": "Fallback: paste a token manually",
+          "collapsed": true,
+          "widgets": [
             {
-              "key": "plaud_bearer_token",
-              "label": "Plaud bearer token",
-              "input": "password",
-              "placeholder": "eyJ… or authorization: eyJ…",
-              "description": "Stored in the zero-knowledge secret store, never in plain config. Saving re-checks the token against Plaud right away — the status line above updates with the real result."
+              "type": "markdown",
+              "value": "Use this only while OAuth isn't connected — e.g. Plaud's OAuth credentials aren't configured yet.\n\n1. Open **[web.plaud.ai](https://web.plaud.ai)** in a new tab and make sure you're logged in.\n2. Open DevTools → Network, click any request to `api.plaud.ai`, and copy its `authorization` request header.\n3. Paste it below — with or without the `Bearer ` prefix, or the whole `authorization: eyJ...` line copied straight from DevTools, all work.\n\nThe token is a short-lived JWT (~24h) with no refresh flow, so you'll repeat this roughly once a day until OAuth is connected."
+            },
+            {
+              "type": "form",
+              "id": "plaud_settings",
+              "submit": { "call": "POST /api/apps/plaud/settings" },
+              "submit_label": "Save",
+              "fields": [
+                {
+                  "key": "plaud_bearer_token",
+                  "label": "Plaud bearer token",
+                  "input": "password",
+                  "placeholder": "eyJ… or authorization: eyJ…",
+                  "description": "Stored in the zero-knowledge secret store, never in plain config. Saving re-checks the token against Plaud right away — the status line above updates with the real result."
+                }
+              ]
             }
           ]
         }

@@ -81,6 +81,29 @@
       }
     ]
   },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "plaud_client_id": {
+        "type": "string",
+        "description": "OAuth client id for Plaud's OAuth API — the still-private-beta product (waitlist at support.plaud.ai) that lets a third-party app read an EXISTING personal account's recordings. NOT the same as dev.plaud.ai's GA 'Plaud Embedded' partner API, which only provisions NEW partner-owned users and can't read Frederico's own 5 recordings. Leave empty until Plaud hands one out; the Settings panel says exactly what's still missing."
+      },
+      "plaud_client_secret": {
+        "type": "string",
+        "x-secret": true,
+        "description": "OAuth client secret paired with plaud_client_id. Never stored in plain config — routed to the secret store via POST /api/apps/plaud/settings, same pattern as the pasted bearer token."
+      },
+      "plaud_oauth_authorize_url": {
+        "type": "string",
+        "description": "Authorize endpoint the browser is redirected to. As of 2026-08-23 Plaud has not published this even to accepted OAuth API beta members — confirmed against docs.plaud.ai and by probing the URL this feature's design originally guessed (web.plaud.ai/platform/oauth), which turned out to be Plaud's own internal workspace-selector route, not a third-party consent screen. Leave empty until Plaud's OAuth API team provides the real one."
+      },
+      "plaud_oauth_token_url": {
+        "type": "string",
+        "description": "Token endpoint the app POSTs the authorization code (+ PKCE verifier), or later a refresh_token, to. Same status as plaud_oauth_authorize_url — not yet published by Plaud."
+      }
+    },
+    "required": []
+  },
   "dependencies": {
     "apps": [
       {
