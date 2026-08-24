@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from plaud_app import mcp_config, oauth, routes  # noqa: E402
+from plaud_app import cli_login, mcp_config, oauth, routes  # noqa: E402
 from plaud_app.client import PlaudClient, PlaudError  # noqa: E402
 
 
@@ -365,3 +365,110 @@ def test_transcript_endpoint_shapes_segments(monkeypatch):
         assert resp.json()["segments"] == [
             {"start_s": 0, "text": "hello"}, {"start_s": 3, "text": "world"},
         ]
+
+
+# ── CLI login routes ──────────────────────────────────────────────────────
+
+def test_cli_login_start_delegates_to_the_manager(monkeypatch):
+    monkeypatch.setattr(
+        cli_login.CliLogin, "start",
+        lambda self: {"phase": "waiting_for_browser", "authorize_url": "https://web.plaud.ai/x", "seconds_remaining": 120, "error": None},
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _ctx = _client(Path(tmp))
+        resp = client.post("/cli/login/start")
+        assert resp.status_code == 200
+        assert resp.json()["phase"] == "waiting_for_browser"
+
+
+def test_cli_login_status_reports_idle_with_no_attempt():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _ctx = _client(Path(tmp))
+        resp = client.get("/cli/login/status")
+        assert resp.json() == {"phase": "idle", "authorize_url": None, "seconds_remaining": 0, "error": None}
+
+
+def test_cli_login_complete_requires_a_callback_url():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _ctx = _client(Path(tmp))
+        resp = client.post("/cli/login/complete", json={})
+        assert resp.status_code == 400
+
+
+def test_cli_login_complete_regenerates_mcp_json_on_success(monkeypatch):
+    monkeypatch.setattr(cli_login.CliLogin, "complete", lambda self, url: {"ok": True})
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        client, ctx = _client(tmp_path)
+        # mcp.json only advertises a server once something is "connected" —
+        # fake that here so write_mcp_json's post-complete call has content
+        # to write (mirrors a real successful complete() having stored tokens).
+        ctx.secrets.write(cli_login.CLI_TOKENS_SECRET_KEY, json.dumps({"access_token": "AT1"}))
+
+        resp = client.post("/cli/login/complete", json={"callback_url": "http://localhost:8199/auth/callback?code=c&state=s"})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        doc = json.loads((tmp_path / "mcp.json").read_text())
+        assert doc["mcpServers"]["aw-plaud"]["type"] == "http"
+
+
+def test_cli_login_complete_passes_through_failure_without_touching_mcp_json(monkeypatch):
+    monkeypatch.setattr(cli_login.CliLogin, "complete", lambda self, url: {"ok": False, "error": "nope"})
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        client, _ctx = _client(tmp_path)
+        resp = client.post("/cli/login/complete", json={"callback_url": "http://localhost:8199/auth/callback?code=c&state=s"})
+        assert resp.json() == {"ok": False, "error": "nope"}
+        assert not (tmp_path / "mcp.json").exists()
+
+
+def test_cli_login_panel_serves_html():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _ctx = _client(Path(tmp))
+        resp = client.get("/cli/login/panel")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        assert "Connect with Plaud" in resp.text
+
+
+def test_status_reports_cli_as_the_auth_method_once_connected(monkeypatch):
+    def _raise(self, path, *, timeout=20.0):
+        raise PlaudError("network unavailable in test")
+    monkeypatch.setattr(PlaudClient, "_get_json", _raise)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client, ctx = _client(Path(tmp))
+        ctx.secrets.write(cli_login.CLI_TOKENS_SECRET_KEY, json.dumps({
+            "access_token": "AT1", "refresh_token": "RT1", "expires_at": time.time() + 3600 * 10,
+        }))
+        resp = client.get("/status")
+        body = resp.json()
+        assert body["auth_method"] == "cli"
+        assert body["error"] is None
+        assert body["expires_in_text"] == "expires in 10h"
+
+
+def test_status_cli_takes_priority_over_a_pasted_bearer_for_auth_method(monkeypatch):
+    # Both "connected" at once is an edge case, not the normal flow — but
+    # the recommended method should be what's reported.
+    def _raise(self, path, *, timeout=20.0):
+        raise PlaudError("network unavailable in test")
+    monkeypatch.setattr(PlaudClient, "_get_json", _raise)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client, ctx = _client(Path(tmp))
+        client.post("/settings", json={"plaud_bearer_token": "eyTest.token.here"})
+        ctx.secrets.write(cli_login.CLI_TOKENS_SECRET_KEY, json.dumps({
+            "access_token": "AT1", "refresh_token": "RT1", "expires_at": time.time() + 3600,
+        }))
+        resp = client.get("/status")
+        assert resp.json()["auth_method"] == "cli"
+
+
+def test_logout_also_clears_the_cli_connection():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, ctx = _client(Path(tmp))
+        ctx.secrets.write(cli_login.CLI_TOKENS_SECRET_KEY, json.dumps({"access_token": "AT1"}))
+        resp = client.post("/logout")
+        assert resp.status_code == 200
+        assert cli_login.is_connected(ctx) is False

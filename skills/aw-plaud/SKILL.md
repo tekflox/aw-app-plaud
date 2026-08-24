@@ -1,6 +1,6 @@
 ---
 name: aw-plaud
-description: Personal Plaud account (AI recorder — Note/NotePin/Note Pro) connector, exposed as the aw-plaud MCP server by aw-app-plaud. Covers the tool reference (list recordings, get transcript/summary, download audio), the Apps › Plaud UI (list/play/download/transcript/summary), how to obtain/refresh the bearer token (unofficial web API — official OAuth API is still private beta), and known limitations. Use whenever asked to pull Plaud recordings/transcripts, import Plaud notes somewhere (e.g. into Notion), or configure/debug the Plaud integration.
+description: Personal Plaud account (AI recorder — Note/NotePin/Note Pro) connector, exposed as the aw-plaud MCP server by aw-app-plaud. Covers the tool reference (list recordings, get transcript/summary, download audio), the Apps › Plaud UI (list/play/download/transcript/summary), the three ways to connect (the recommended official-CLI login flow, this app's own dormant/waitlisted OAuth client, and the pasted-bearer fallback), and known limitations. Use whenever asked to pull Plaud recordings/transcripts, import Plaud notes somewhere (e.g. into Notion), or configure/debug the Plaud integration.
 ---
 
 # aw-plaud — Plaud connector
@@ -40,29 +40,105 @@ lifted from a logged-in browser session. This is the same approach
 community projects (`openplaud`, `plaud-toolkit`) use — reverse engineered,
 not supported by Plaud.
 
-## OAuth (the primary path, once Plaud provides real endpoints)
+## Three ways to connect
 
-`aw-app-plaud` is itself an OAuth client (`plaud_app/oauth.py`):
+Settings → Plaud shows all three, in this order:
+
+1. **Official-CLI login (recommended)** — this app runs the real, first-party
+   `@plaud-ai/mcp` CLI *inside its own container* and orchestrates its login.
+   See "The official-CLI login flow" below.
+2. **This app's own OAuth client** (`plaud_app/oauth.py`) — dormant until
+   Plaud hands out real credentials off their OAuth API waitlist. See "Own
+   OAuth client" below.
+3. **Pasted bearer token** — the original fallback, unchanged. See
+   "Obtaining / refreshing the token" below.
+
+All three ultimately feed the same `PlaudClient` (`plaud_app/client.py`) the
+same way: a bearer token good for `api.plaud.ai`. `routes.py`'s
+`_combined_token_getter` tries them in the order above.
+
+## The official-CLI login flow (recommended)
+
+**This was previously believed impossible from inside this workspace** — an
+earlier version of this doc said so, reasoning that the CLI's OAuth
+redirect_uri (`http://localhost:8199/auth/callback`) is a loopback address
+no external browser could ever reach. That's true for the *browser*, but
+irrelevant for who actually needs to reach it: **the process that owns
+`localhost:8199` only needs to be the process running the login, not the
+browser.** So this app runs the CLI itself, in its own container, where
+`localhost:8199` is real and reachable — see `plaud_app/cli_login.py`'s
+module docstring for the full mechanism, discovered 2026-08-24 by reading
+the CLI's own bundle (`npm pack @plaud-ai/mcp` + read `dist/*.js`).
+
+The 4 things that make this work, briefly (full detail in `cli_login.py`):
+
+1. **2-minute window.** The CLI's own login step times out after 120s and
+   mints a fresh PKCE pair on every attempt — `start()` always kills
+   whatever attempt is currently running first, so a stale link is never
+   reusable.
+2. **`~/.plaud/tokens-mcp.json` survives a container recreation** because
+   the CLI runs with `HOME` pointed at `$AW_WORKSPACE_HOME/data/plaud/cli-home`
+   — durable, and ours.
+3. **The installer's `~/.claude` side effect (MCP registration + 7 skills)
+   never touches the real workspace home** — same `HOME` override contains
+   it. Rather than fake "Claude Code" detected (which would shell out to a
+   real `claude mcp add`, dependent on that binary being on PATH in
+   whatever process runs this app, and would trigger the skills copy), an
+   empty `.cursor/` dir is pre-seeded instead: it satisfies the installer's
+   "at least one local client detected" gate with a dependency-free plain
+   JSON-file write, confirmed live against the real CLI 2026-08-24.
+4. **npx/npm cache** is pointed at this app's own
+   `$AW_WORKSPACE_HOME/data/plaud/npm-cache`, never the shared `$HOME/.npm`
+   (root-owned cache entries there break every later install with EACCES —
+   see `app-npm-install-eacces-home-cache` in the KB).
+
+**The one step only a human can do:** open the authorize link Settings
+shows, approve in your own browser, and paste back the URL the browser
+lands on afterwards — a connection-refused page, since it's redirecting to
+`localhost:8199` on *your* machine, not this workspace's. That's expected,
+and the panel says so before it happens. Pasting it lets this app extract
+`code`/`state` and GET the CLI's own callback server with them; the
+subprocess does the actual token exchange.
+
+**Refresh** after that is this app's own responsibility (`cli_login.
+get_valid_access_token`), since the CLI subprocess isn't kept running — it
+POSTs `https://platform.plaud.ai/developer/api/oauth/third-party/access-token/refresh`
+with just `refresh_token` (no client_id/secret needed on refresh, confirmed
+from the CLI's own bundle). That endpoint — along with the exchange one the
+CLI subprocess itself uses — is the real "Plaud OAuth API" `oauth.py`'s own
+docstring describes as unpublished; the CLI's bundle is what published it,
+for its own first-party `client_id` only. Not verified against a real
+completed refresh yet (no live token to test with as of this writing).
+
+**Unverified end-to-end:** completing a real browser authorization needs a
+human, which building this flow did not include. If `plaud_status` doesn't
+report connected after a real completed login, the most likely cause is
+that a CLI-issued token isn't valid for `api.plaud.ai`'s endpoints (a
+different auth realm than `platform.plaud.ai/developer/api`, which is what
+the CLI itself actually calls) — check that first.
+
+## Own OAuth client (waitlisted)
+
+`aw-app-plaud` is also, separately, its own OAuth client (`plaud_app/oauth.py`):
 PKCE authorization-code flow, its own public callback
-(`/api/apps/plaud/oauth/callback`, built from `AW_WORKSPACE_API_URL` — no
-`localhost` loopback, which is why the *official* `@plaud-ai/mcp` CLI can't
-be used from inside this workspace at all: its redirect_uri is
-`http://localhost:8199/auth/callback`, a server on the agent container the
-authorizing browser, wherever it is, can never reach), transparent refresh,
-and revocation handling (a failed refresh with `invalid_grant` clears the
-stored tokens instead of retry-looping).
+(`/api/apps/plaud/oauth/callback`, built from `AW_WORKSPACE_API_URL`),
+transparent refresh, and revocation handling (a failed refresh with
+`invalid_grant` clears the stored tokens instead of retry-looping).
 
 The catch: `plaud_client_id` / `plaud_client_secret` /
 `plaud_oauth_authorize_url` / `plaud_oauth_token_url` (`config_schema` in
 `aw-app.json`, the last two also x-secret-adjacent — see the app itself)
-are **empty by design** — Plaud hasn't published them (see above). The
-Settings panel (Apps → Plaud → Settings, or Settings → Plaud directly)
-shows exactly which of the 4 are missing. Nothing to guess or hardcode:
-once Plaud hands out real values off the OAuth API waitlist, paste them in
-and Connect starts working with no code change.
+are **empty by design** — Plaud hasn't published them to third parties (the
+official-CLI flow above discovered the real URLs, but they're only usable
+by the CLI's own first-party `client_id`+fixed `localhost:8199` redirect —
+this app still has no client_id of its own). The Settings panel shows
+exactly which of the 4 are missing. Nothing to guess or hardcode: once
+Plaud hands out real values off the OAuth API waitlist, paste them in and
+Connect starts working with no code change. Prefer the CLI flow above until
+then.
 
-The pasted-bearer flow below remains the fallback for as long as OAuth
-isn't connected — do not remove it.
+The pasted-bearer flow below remains the fallback for as long as neither of
+the above is connected — do not remove it.
 
 ## Tool reference (MCP)
 
@@ -153,12 +229,13 @@ like an auth problem but aren't.
   elsewhere, e.g. import into Notion).
 - **The pasted-bearer path still has no auto-refresh** — the JWT lasts
   ~24h and needs re-pasting, or every tool call and the whole UI start
-  401ing. This is now the FALLBACK, not the only option: once OAuth
-  (above) is actually connected, refresh is automatic and this limitation
-  no longer applies. Getting there needs Plaud to hand out real
-  `plaud_oauth_authorize_url` / `plaud_oauth_token_url` values off their
-  OAuth API waitlist — check `support.plaud.ai`'s OAuth API FAQ / your
-  waitlist status periodically.
+  401ing. This is now the last-resort FALLBACK, not the only option: the
+  official-CLI login flow (recommended) and this app's own OAuth client
+  (waitlisted) both refresh automatically once connected.
+- **The official-CLI login needs a human for the browser step, once.**
+  There's no way around this — Plaud's consent screen needs a real logged-in
+  browser. It's a one-time cost per connection (refresh after that is
+  automatic), not a recurring one like the pasted-bearer path.
 - The shared Playwright browser (`aw-browser` container, CDP :9223) is
   genuinely multi-tenant — other concurrent sessions can steal/close tabs
   mid-flow. If you need a human to complete an interactive login there

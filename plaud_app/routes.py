@@ -16,12 +16,13 @@ aw-app-notion's ``notion_token`` / aw-app-git's ``github_token``.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import Body, FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
-from . import mcp_config, oauth
+from . import cli_login, cli_panel, mcp_config, oauth
 from .client import PlaudClient, PlaudError, format_expiry_text, normalize_pasted_token
 
 log = logging.getLogger("aw_apps.plaud.routes")
@@ -31,9 +32,10 @@ TOKEN_KEY = "plaud_bearer_token"
 
 def _oauth_error_text(ctx) -> str | None:
     """The one sentence the settings panel's `error_text` shows for
-    whichever non-happy OAuth state currently applies, checked in priority
-    order. `None` means OAuth has nothing to report right now (either fully
-    connected, or never touched at all)."""
+    whichever non-happy OWN-OAuth state currently applies (the config-driven
+    ``oauth.py`` path — dormant until Plaud hands out waitlist credentials).
+    `None` means it has nothing to report right now (either fully connected,
+    or never touched at all)."""
     missing = oauth.missing_config(ctx)
     if missing:
         return f"OAuth not configured — missing: {', '.join(missing)}."
@@ -44,17 +46,38 @@ def _oauth_error_text(ctx) -> str | None:
     return None
 
 
+def _auth_error_text(ctx) -> str | None:
+    """Same idea as ``_oauth_error_text``, checked across all three
+    connection methods in priority order — CLI (recommended) first, since
+    that's the one expected to actually be in use once Plaud's own OAuth API
+    is still waitlisted. Falls through to the pre-existing own-OAuth check
+    unchanged so its behavior (and the tests pinning it) doesn't shift for
+    anyone who never touches the CLI path."""
+    if cli_login.is_connected(ctx):
+        _token, error = cli_login.get_valid_access_token(ctx)
+        if error:
+            return f"Plaud connection expired and refresh failed: {error}. Reconnect below."
+        return None
+    return _oauth_error_text(ctx)
+
+
 def _status_payload(ctx, client: PlaudClient, doc_servers: dict) -> dict:
     st = client.status()
+    cli_connected = cli_login.is_connected(ctx)
     oauth_connected = oauth.is_connected(ctx)
     bearer_present = bool(ctx.secrets.read(TOKEN_KEY))
-    auth_method = "oauth" if oauth_connected else ("bearer" if bearer_present else None)
+    auth_method = "cli" if cli_connected else ("oauth" if oauth_connected else ("bearer" if bearer_present else None))
     oauth_missing = oauth.missing_config(ctx)
-    error = st.error if (bearer_present and not oauth_connected) else _oauth_error_text(ctx)
-    # An OAuth access token has no reason to be a JWT (could be opaque), so
-    # PlaudClient.status()'s exp-claim-derived expires_at doesn't apply to
-    # it — use the expiry oauth.py tracked from the token response instead.
-    expires_at = oauth.token_expiry(ctx) if oauth_connected else st.expires_at
+    error = st.error if (bearer_present and not oauth_connected and not cli_connected) else _auth_error_text(ctx)
+    # A CLI- or OAuth-obtained access token has no reason to be a JWT (could
+    # be opaque), so PlaudClient.status()'s exp-claim-derived expires_at
+    # doesn't apply to it — use whichever source's own tracked expiry instead.
+    if cli_connected:
+        expires_at = cli_login.token_expiry(ctx)
+    elif oauth_connected:
+        expires_at = oauth.token_expiry(ctx)
+    else:
+        expires_at = st.expires_at
     return {
         # "logged_in" is what a status-bound widget would look for;
         # "configured" is the same value under the name every other caller
@@ -80,22 +103,40 @@ def _mcp_gate_token(ctx) -> str | None:
     """Whatever truthy sentinel gates `mcp_config.write_mcp_json` — the
     string's *content* is never used (this app's mcp.json entry always
     points at its own already-authenticated /mcp route, see
-    mcp/self_register.py), only its presence. OAuth being the connected
-    method still has to enable the MCP server exactly like a pasted bearer
-    token always did."""
+    mcp/self_register.py), only its presence. Any connected method still has
+    to enable the MCP server exactly like a pasted bearer token always did."""
     bearer = ctx.secrets.read(TOKEN_KEY)
     if bearer:
         return bearer
+    if cli_login.is_connected(ctx):
+        return "cli-connected"
     return "oauth-connected" if oauth.is_connected(ctx) else None
+
+
+def _combined_token_getter(ctx):
+    """The callable handed to ``PlaudClient(token_getter=...)`` — tries all
+    three sources in priority order (CLI, own OAuth, pasted bearer), same
+    "connected but currently broken → don't silently fall back" contract
+    ``oauth.make_token_getter`` already had for its one source."""
+    def _get() -> str | None:
+        token, error = cli_login.get_valid_access_token(ctx)
+        if token:
+            return token
+        if error:
+            return None
+        return oauth.make_token_getter(ctx, lambda: ctx.secrets.read(TOKEN_KEY))()
+    return _get
 
 
 def build_routes(ctx) -> FastAPI:
     app = FastAPI(title="plaud")
 
     # Resolved per call, never snapshotted: a token saved (or cleared) at
-    # runtime has to take effect without a restart. OAuth first (refreshed
-    # transparently), the pasted bearer token as a fallback — see oauth.py.
-    client = PlaudClient(oauth.make_token_getter(ctx, lambda: ctx.secrets.read(TOKEN_KEY)))
+    # runtime has to take effect without a restart. CLI first (recommended,
+    # refreshed transparently), then own-OAuth, then the pasted bearer token
+    # as the last-resort fallback — see _combined_token_getter above.
+    client = PlaudClient(_combined_token_getter(ctx))
+    cli_login_mgr = cli_login.CliLogin(ctx)
 
     def _guard(fn, *args, **kwargs):
         """Run a Plaud API call, turning a PlaudError into its real HTTP
@@ -132,11 +173,12 @@ def build_routes(ctx) -> FastAPI:
 
     @app.post("/logout")
     async def clear_token() -> dict:
-        """Disconnects BOTH auth methods — whichever is active, "Logout"
-        means fully disconnected, not "disconnect only the one you happened
-        to use last"."""
+        """Disconnects ALL THREE auth methods — whichever is active,
+        "Logout" means fully disconnected, not "disconnect only the one you
+        happened to use last"."""
         ctx.secrets.delete(TOKEN_KEY)
         oauth.disconnect(ctx)
+        cli_login.disconnect(ctx)
         mcp_config.write_mcp_json(ctx.package_dir, None)
         return {"ok": True, "logged_in": False, "configured": False}
 
@@ -187,6 +229,35 @@ def build_routes(ctx) -> FastAPI:
         oauth.disconnect(ctx)
         mcp_config.write_mcp_json(ctx.package_dir, _mcp_gate_token(ctx))
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # CLI login — orchestrates the official `@plaud-ai/mcp` CLI's own OAuth
+    # (see cli_login.py's module docstring for the why/how). This is the
+    # recommended connection method while oauth.py's own client stays
+    # waitlisted.
+    # ------------------------------------------------------------------
+
+    @app.post("/cli/login/start")
+    async def cli_login_start() -> dict:
+        return await asyncio.to_thread(cli_login_mgr.start)
+
+    @app.get("/cli/login/status")
+    async def cli_login_status() -> dict:
+        return cli_login_mgr.status()
+
+    @app.post("/cli/login/complete")
+    async def cli_login_complete(data: dict = Body(...)) -> dict:
+        callback_url = (data.get("callback_url") or "").strip()
+        if not callback_url:
+            return JSONResponse({"ok": False, "error": "callback_url is required"}, status_code=400)
+        result = await asyncio.to_thread(cli_login_mgr.complete, callback_url)
+        if result.get("ok"):
+            mcp_config.write_mcp_json(ctx.package_dir, _mcp_gate_token(ctx))
+        return result
+
+    @app.get("/cli/login/panel")
+    async def cli_login_panel() -> HTMLResponse:
+        return HTMLResponse(cli_panel.PANEL_HTML)
 
     # ------------------------------------------------------------------
     # Recordings — the UI's data surface. Not a REST mirror of the MCP

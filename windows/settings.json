@@ -16,12 +16,35 @@
       ]
     },
     {
-      "id": "oauth",
+      "id": "cli",
       "widgets": [
         {
           "type": "markdown",
           "hide_when_logged_in": true,
-          "value": "### Connect\n\n[**Connect with Plaud**](/api/apps/plaud/oauth/start)\n\nOpens in a new tab. You authorize in your own browser — wherever you're already logged into [web.plaud.ai](https://web.plaud.ai) — and this app comes back connected with no token to copy and refresh handled automatically from then on.\n\nIf the message above says OAuth isn't configured yet, that's real: this app is the OAuth client, but it needs `plaud_client_id`/`plaud_client_secret` and the authorize/token endpoint URLs from Plaud's OAuth API first (still private-beta as of 2026-08-23 — see this app's `aw-plaud` skill)."
+          "value": "### Connect (recommended)\n\nThis app runs the official Plaud CLI (`@plaud-ai/mcp`) on your behalf — its login flow needs a `localhost` callback only *it* can reach, which is exactly what running it here solves."
+        },
+        {
+          "type": "iframe",
+          "hide_when_logged_in": true,
+          "title": "Connect with Plaud",
+          "src": "/api/apps/plaud/cli/login/panel"
+        }
+      ]
+    },
+    {
+      "id": "oauth",
+      "widgets": [
+        {
+          "type": "collapsible",
+          "title": "Alternative: this app's own OAuth client (waitlisted)",
+          "collapsed": true,
+          "hide_when_logged_in": true,
+          "widgets": [
+            {
+              "type": "markdown",
+              "value": "[**Connect with Plaud**](/api/apps/plaud/oauth/start)\n\nOpens in a new tab. Only useful once this app has real OAuth credentials of its own — `plaud_client_id`/`plaud_client_secret` and the authorize/token endpoint URLs from Plaud's OAuth API, still private-beta and waitlist-only as of 2026-08-23 (see this app's `aw-plaud` skill). Prefer **Connect (recommended)** above until then."
+            }
+          ]
         }
       ]
     },
