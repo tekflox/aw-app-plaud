@@ -248,7 +248,16 @@ class PlaudClient:
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             raise PlaudError(f"fetching content failed: {exc}") from exc
-        return gzip.decompress(resp.content).decode("utf-8", errors="replace")
+        # The URL points at a `.json.gz` S3 object, but that's just the key
+        # name — httpx transparently decodes the body itself whenever the
+        # response carries `Content-Encoding: gzip`, so resp.content is
+        # already plain UTF-8 in that case. Sniff the gzip magic header
+        # rather than trusting the suffix, or this double-decompresses and
+        # crashes on the now-plain bytes.
+        content = resp.content
+        if content[:2] == b"\x1f\x8b":
+            content = gzip.decompress(content)
+        return content.decode("utf-8", errors="replace")
 
     def get_transcript(self, file_id: str) -> list[dict]:
         """List of ``{start_s, text}`` segments — structured for the UI;

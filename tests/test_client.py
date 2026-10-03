@@ -7,6 +7,7 @@ Run: .venv/aw/bin/python -m pytest tests/test_client.py
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import sys
 import time
@@ -173,3 +174,38 @@ def test_format_expiry_text_expired_hours_ago():
 
 def test_format_expiry_text_just_expired():
     assert format_expiry_text(time.time() - 1) == "expired"
+
+
+class _FakeContentResponse:
+    """Stand-in for httpx.Response — just enough surface for _fetch_gz_text."""
+
+    def __init__(self, content: bytes):
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+
+def test_fetch_gz_text_handles_already_decoded_content(monkeypatch):
+    # httpx auto-decodes when the S3 object is served with
+    # Content-Encoding: gzip — resp.content is then already plain JSON, and
+    # calling gzip.decompress() on it a second time must not be attempted.
+    plain = b'[{"start_time": 0, "content": "hello"}]'
+    monkeypatch.setattr(
+        client_module.httpx, "get", lambda *a, **k: _FakeContentResponse(plain)
+    )
+    client = PlaudClient(lambda: _fake_jwt(time.time() + 3600))
+    assert client._fetch_gz_text("https://example.com/x.json.gz") == plain.decode("utf-8")
+
+
+def test_fetch_gz_text_decompresses_genuinely_gzipped_content(monkeypatch):
+    # The other branch: httpx did NOT auto-decode (no Content-Encoding
+    # header set on the response), so resp.content is still real gzip bytes
+    # and must be decompressed.
+    plain = b'[{"start_time": 0, "content": "hello"}]'
+    compressed = gzip.compress(plain)
+    monkeypatch.setattr(
+        client_module.httpx, "get", lambda *a, **k: _FakeContentResponse(compressed)
+    )
+    client = PlaudClient(lambda: _fake_jwt(time.time() + 3600))
+    assert client._fetch_gz_text("https://example.com/x.json.gz") == plain.decode("utf-8")
