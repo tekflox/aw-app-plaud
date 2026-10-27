@@ -341,11 +341,24 @@ class CliLogin:
         """Called (off the originating worker's reader/watchdog threads, or
         from start() itself) on every ``LoginAttempt`` mutation. Releases
         the lease once the attempt is resolved — a worker that still held
-        it after that would block every other worker's restart forever."""
+        it after that would block every other worker's restart forever.
+
+        Also clears ``self._attempt`` back to ``None`` on that same
+        transition, identity-checked against ``attempt`` — without this, a
+        worker that ever originated ANY now-terminal attempt stays
+        permanently pinned to that one stale local object and never falls
+        through to the kv fallback again, even for a later attempt a
+        DIFFERENT worker starts. The identity check matters because
+        start()'s restart path reassigns ``self._attempt`` to a fresh
+        attempt before the old one's killed subprocess actually exits — an
+        unconditional clear here could otherwise null out that fresh
+        attempt instead of the stale one it's racing against."""
         record = attempt.record()
         self._kv_put_sync(record, ttl=LOGIN_WINDOW_S + 30)
         if record["phase"] in ("connected", "timed_out", "error"):
             self.ctx.state.lease.release(_LEASE_NAME)
+            if self._attempt is attempt:
+                self._attempt = None
 
     def _kv_snapshot_or_idle(self) -> dict:
         record = self._kv_get_sync()

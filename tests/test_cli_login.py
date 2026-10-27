@@ -148,9 +148,37 @@ def test_start_isolates_home_and_npm_cache_and_preseeds_cursor_dir(tmp_path, mon
     assert (home / ".cursor").is_dir()
 
 
+class _StillRunningFakeProc:
+    """A fake Popen whose stdout pipe never closes — the background reader
+    thread blocks on it forever instead of racing ahead to mark_exit()
+    before this test's own assertions run. Needed because ``_mirror_attempt``
+    now clears ``self._attempt`` once an attempt resolves (see cli_login.py):
+    plain ``_FakeProc()``'s already-exhausted stdout would resolve almost
+    instantly, making the "previous attempt is still live when start() is
+    called again" premise of this test nondeterministic."""
+
+    def __init__(self, pid=999999):
+        self.pid = pid
+        self.stdout = self
+        self._killed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        time.sleep(3600)
+
+    def poll(self):
+        return 0 if self._killed else None
+
+    def wait(self, timeout=None):
+        self._killed = True
+        return 0
+
+
 def test_start_kills_the_previous_attempt_before_spawning_a_new_one(tmp_path, monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
-    monkeypatch.setattr(cli_login.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(cli_login.subprocess, "Popen", lambda *a, **k: _StillRunningFakeProc())
     killed = []
     monkeypatch.setattr(cli_login, "_kill", lambda proc: killed.append(proc))
 

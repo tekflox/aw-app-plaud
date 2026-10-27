@@ -359,3 +359,71 @@ class TestConcurrentStartCrossWorker:
             proc_a.finish(0)
 
         asyncio.run(scenario())
+
+
+class TestWorkerLocalStalenessAfterResolution:
+    def test_status_on_worker_b_falls_through_to_kv_after_its_own_earlier_attempt_resolved(
+            self, tmp_path, monkeypatch):
+        """Regression proof for the QA-rejected delivery (occurrence #2):
+        before the ``_mirror_attempt`` fix, a worker that ever originated
+        ANY now-terminal attempt stayed pinned to that stale local object
+        forever — ``self._attempt is not None`` short-circuited status()/
+        complete() straight past the kv fallback for every later attempt,
+        even one a DIFFERENT worker started. Worker B resolves its own
+        attempt first, then worker A starts and resolves a brand new one —
+        B's status() must reflect A's, not its own stale terminal one."""
+        monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+        _neutralize_kill(monkeypatch)
+        store = _FakeSecretStore()
+
+        procs = []
+
+        def fake_popen(argv, **kwargs):
+            proc = _QueueProc(pid=900100 + len(procs))
+            procs.append(proc)
+            return proc
+        monkeypatch.setattr(cli_login.subprocess, "Popen", fake_popen)
+
+        async def scenario():
+            ctx_a = _fresh_ctx(store)
+            ctx_b = _fresh_ctx(store)
+            mgr_a = cli_login.CliLogin(ctx_a)
+            mgr_b = cli_login.CliLogin(ctx_b)
+
+            # Worker B originates and fully resolves its own attempt first —
+            # the leftover "my own earlier, already-terminal object" the
+            # live repro actually hit.
+            await asyncio.to_thread(mgr_b.start)
+            proc_b = mgr_b._attempt.proc
+            proc_b.send_line("  timed out after 2 minutes")
+            proc_b.finish(0)
+
+            async def b_sees_timed_out():
+                status = await mgr_b.status()
+                return status["phase"] == "timed_out"
+            assert await _wait_until(b_sees_timed_out)
+            assert mgr_b._attempt is None, (
+                "worker B must drop its own reference once that attempt "
+                "resolved, or it can never fall through to kv again")
+
+            # Worker A starts a brand new attempt afterwards.
+            await asyncio.to_thread(mgr_a.start)
+            proc_a = mgr_a._attempt.proc
+            proc_a.send_line(
+                "  https://web.plaud.ai/platform/oauth?client_id=def&redirect_uri="
+                "http%3A%2F%2Flocalhost%3A8199%2Fauth%2Fcallback&state=uvw")
+
+            async def b_sees_a():
+                status = await mgr_b.status()
+                return status["phase"] == "waiting_for_browser"
+            assert await _wait_until(b_sees_a), (
+                "worker B stayed pinned to its own stale, terminal attempt "
+                "instead of falling through to kv for worker A's live one")
+            status_b = await mgr_b.status()
+            assert status_b["authorize_url"] == (
+                "https://web.plaud.ai/platform/oauth?client_id=def&redirect_uri="
+                "http%3A%2F%2Flocalhost%3A8199%2Fauth%2Fcallback&state=uvw")
+
+            proc_a.finish(0)
+
+        asyncio.run(scenario())
