@@ -69,6 +69,7 @@ plain expired/401 the same way any other bad token would.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -78,6 +79,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -91,6 +93,15 @@ CALLBACK_URL = f"http://127.0.0.1:{CALLBACK_PORT}/auth/callback"
 LOGIN_WINDOW_S = 120  # mirrors the CLI's own LOGIN_TIMEOUT_MS
 PROC_TIMEOUT_S = 180  # npx resolve + the 120s login window + slack
 COMPLETE_WAIT_S = 15  # how long we wait, after the callback GET, for the CLI to report an outcome
+
+# Cross-worker state (AW_WORKSPACE_WORKERS=5, docs/standards/app-shared-state.md).
+# One in-progress attempt is a single fact shared by every worker: a named
+# lease decides which worker's subprocess is the real one, and a TTL'd kv
+# record lets every OTHER worker answer status()/complete() for an attempt
+# it did not start.
+_LEASE_NAME = "cli-login"
+_ATTEMPT_KV_NAME = "cli-login-attempt"
+_KV_BRIDGE_TIMEOUT_S = 5.0
 
 # Discovered from the CLI's own bundle (chunk-5NWKLF3V.js) — the real
 # "Plaud OAuth API" endpoints, previously unpublished (see oauth.py's
@@ -116,6 +127,20 @@ def _tokens_path() -> Path:
     return _home_dir() / ".plaud" / "tokens-mcp.json"
 
 
+def _public_snapshot(phase: str, authorize_url: str | None, error: str | None,
+                      started_at: float) -> dict:
+    """The countdown/timeout derivation ``LoginAttempt.snapshot()`` always
+    did, factored out so a kv-mirrored record (a point-in-time dict, no
+    ``LoginAttempt`` object behind it on the reading worker) can be turned
+    into the exact same public shape."""
+    remaining = 0
+    if phase == "waiting_for_browser":
+        remaining = max(0, int(LOGIN_WINDOW_S - (time.time() - started_at)))
+        if remaining <= 0:
+            phase = "timed_out"
+    return {"phase": phase, "authorize_url": authorize_url, "seconds_remaining": remaining, "error": error}
+
+
 class LoginAttempt:
     """One ``npx @plaud-ai/mcp install --yes`` run and what its stdout has
     told us so far. A fresh instance per attempt."""
@@ -128,6 +153,10 @@ class LoginAttempt:
         self.phase: str = "starting"
         self.error: str | None = None
         self._lock = threading.Lock()
+        # Set by CliLogin.start() right after construction — fired (off the
+        # lock) on every mutation below so the originating worker's CliLogin
+        # can mirror the new fact into ctx.state.kv for every other worker.
+        self.on_update: Callable[[], None] | None = None
 
     def observe_line(self, line: str) -> None:
         with self._lock:
@@ -146,32 +175,43 @@ class LoginAttempt:
             elif "failed:" in line and line.strip().startswith("✗"):
                 self.phase = "error"
                 self.error = line.split("failed:", 1)[1].strip()
+        if self.on_update is not None:
+            self.on_update()
 
     def mark_exit(self, returncode: int) -> None:
         with self._lock:
             if self.phase not in ("connected", "timed_out", "error"):
                 self.phase = "error"
                 self.error = f"plaud-mcp install exited ({returncode}) with no recognized outcome"
+        if self.on_update is not None:
+            self.on_update()
 
     def mark_killed(self, reason: str) -> None:
         with self._lock:
             if self.phase not in ("connected", "timed_out", "error"):
                 self.phase = "error"
                 self.error = reason
+        if self.on_update is not None:
+            self.on_update()
 
     def snapshot(self) -> dict:
         with self._lock:
-            remaining = 0
-            if self.phase == "waiting_for_browser":
-                remaining = max(0, int(LOGIN_WINDOW_S - (time.time() - self.started_at)))
-                phase = "timed_out" if remaining <= 0 else self.phase
-            else:
-                phase = self.phase
+            phase, authorize_url, error, started_at = self.phase, self.authorize_url, self.error, self.started_at
+        return _public_snapshot(phase, authorize_url, error, started_at)
+
+    def record(self) -> dict:
+        """The raw fact snapshot mirrored to ``ctx.state.kv`` — distinct
+        from ``snapshot()``'s derived public shape (seconds_remaining is
+        recomputed from ``started_at`` wherever it's read, not stored) and
+        including the subprocess ``pid`` (not the ``Popen`` object, which
+        cannot cross a process boundary) so another worker can signal it."""
+        with self._lock:
             return {
-                "phase": phase,
+                "phase": self.phase,
                 "authorize_url": self.authorize_url,
-                "seconds_remaining": remaining,
                 "error": self.error,
+                "started_at": self.started_at,
+                "pid": self.proc.pid if self.proc is not None else None,
             }
 
 
@@ -191,6 +231,26 @@ def _kill(proc: subprocess.Popen | None) -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _kill_by_pid(pid: int) -> None:
+    """Same whole-process-group kill as ``_kill``, for a subprocess this
+    worker did not itself spawn — any worker may need to clear a stale
+    attempt left by another one, by pid (from the kv snapshot), since there
+    is no local ``Popen`` to signal or ``.wait()`` on here. The PID
+    namespace is shared (one container), so sending the signal still
+    reaches the real process; ``.wait()`` would raise ECHILD on a pid this
+    process never forked, so this escalates on a short poll instead."""
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    time.sleep(0.5)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         pass
 
@@ -215,21 +275,116 @@ def _watchdog(proc: subprocess.Popen, attempt: LoginAttempt) -> None:
 
 
 class CliLogin:
-    """One instance lives for the app's lifetime (see ``routes.py``). Holds
-    the in-memory state of whichever login attempt is current — this is
+    """One instance lives for the app's lifetime (see ``routes.py``), one
+    per worker process (``AW_WORKSPACE_WORKERS``). ``self._attempt`` is
+    this worker's own in-memory handle on an attempt it originated —
     intentionally NOT persisted: on a workspace restart it resets to
     "idle", but ``ctx.secrets``' ``CLI_TOKENS_SECRET_KEY`` (the actual
     connection) survives that unaffected. Callers that need to know "are we
     really connected" should read ``is_connected(ctx)``, not this object's
-    ``status()`` — the latter is only about an *in-progress* attempt."""
+    ``status()`` — the latter is only about an *in-progress* attempt.
+
+    A ``POST /cli/login/status`` or ``/complete`` following a ``start()``
+    almost always lands on a DIFFERENT worker (``self._attempt is None``
+    there) — see docs/standards/app-shared-state.md. Ownership of the
+    subprocess (only one worker may spawn it) is ``ctx.state.lease``,
+    flock-backed; the attempt's phase/authorize_url/error/pid is mirrored to
+    ``ctx.state.kv`` (TTL'd, Redis-backed) on every update so any worker can
+    answer for it.
+    """
 
     def __init__(self, ctx) -> None:
         self.ctx = ctx
         self._attempt: LoginAttempt | None = None
+        # Captured at construction time, which always happens on the ASGI
+        # event loop (build_routes(ctx) runs inside plugin.py's async
+        # activate()) — the loop ctx.state's redis.asyncio client gets bound
+        # to on first use. start()/complete() run on a plain thread
+        # (asyncio.to_thread), and the subprocess reader/watchdog are plain
+        # threading.Thread targets — none of them have a loop of their own,
+        # so kv calls from them are bridged onto THIS loop via
+        # run_coroutine_threadsafe rather than asyncio.run()'ing a throwaway
+        # one, which would silently trip the breaker against a client bound
+        # to a different loop. None in a context with no running loop (e.g.
+        # a unit test that constructs CliLogin outside one) — the bridge
+        # then degrades to a no-op/miss, same posture as Redis being down.
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+
+    # ---- ctx.state bridge (never called from the loop thread itself —
+    # that would deadlock; see the loop capture note above) ---------------
+
+    def _kv_put_sync(self, record: dict, ttl: float) -> None:
+        if self._loop is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self.ctx.state.kv.put(_ATTEMPT_KV_NAME, record, ttl=ttl), self._loop)
+        try:
+            future.result(timeout=_KV_BRIDGE_TIMEOUT_S)
+        except Exception:
+            log.debug("plaud cli login: could not mirror the attempt via ctx.state.kv", exc_info=True)
+
+    def _kv_get_sync(self) -> dict | None:
+        if self._loop is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            self.ctx.state.kv.get(_ATTEMPT_KV_NAME), self._loop)
+        try:
+            return future.result(timeout=_KV_BRIDGE_TIMEOUT_S)
+        except Exception:
+            log.debug("plaud cli login: could not read the shared attempt snapshot", exc_info=True)
+            return None
+
+    def _mirror_attempt(self, attempt: LoginAttempt) -> None:
+        """Called (off the originating worker's reader/watchdog threads, or
+        from start() itself) on every ``LoginAttempt`` mutation. Releases
+        the lease once the attempt is resolved — a worker that still held
+        it after that would block every other worker's restart forever."""
+        record = attempt.record()
+        self._kv_put_sync(record, ttl=LOGIN_WINDOW_S + 30)
+        if record["phase"] in ("connected", "timed_out", "error"):
+            self.ctx.state.lease.release(_LEASE_NAME)
+
+    def _kv_snapshot_or_idle(self) -> dict:
+        record = self._kv_get_sync()
+        if record is None:
+            return {"phase": "idle", "authorize_url": None, "seconds_remaining": 0, "error": None}
+        return _public_snapshot(record.get("phase", "starting"), record.get("authorize_url"),
+                                 record.get("error"), record.get("started_at") or 0.0)
+
+    def _current_snapshot(self) -> dict:
+        """This worker's own attempt if it has one; otherwise whatever the
+        shared kv record says. Sync — bridges like the methods above, so
+        never call this from the loop thread itself."""
+        if self._attempt is not None:
+            return self._attempt.snapshot()
+        return self._kv_snapshot_or_idle()
 
     def start(self) -> dict:
+        claimed = self.ctx.state.lease.claim(_LEASE_NAME)
+        if not claimed:
+            # Another worker's attempt is live right now — report it rather
+            # than racing a second `npx ... install` into the same
+            # port-8199. Read from kv, not self._attempt: THIS worker's own
+            # attempt (if any) is necessarily a stale, already-resolved one,
+            # since it would still hold the lease otherwise.
+            return self._kv_snapshot_or_idle()
+
         if self._attempt is not None:
             _kill(self._attempt.proc)
+        else:
+            # We just won a lease nobody held — if that's because a prior
+            # attempt (on any worker, including this one in an earlier
+            # cycle) released it on reaching a terminal phase, its process
+            # can still be lingering (the watchdog fires up to
+            # PROC_TIMEOUT_S - LOGIN_WINDOW_S later). Clear it by pid before
+            # spawning a fresh one into the same port.
+            prev = self._kv_get_sync()
+            prev_pid = prev.get("pid") if prev else None
+            if prev_pid:
+                _kill_by_pid(prev_pid)
 
         home = _home_dir()
         (home / ".cursor").mkdir(parents=True, exist_ok=True)
@@ -241,6 +396,7 @@ class CliLogin:
 
         attempt = LoginAttempt()
         attempt.started_at = time.time()
+        attempt.on_update = lambda: self._mirror_attempt(attempt)
         try:
             proc = subprocess.Popen(
                 ["npx", "-y", "@plaud-ai/mcp", "install", "--yes"],
@@ -259,18 +415,28 @@ class CliLogin:
             attempt.phase = "error"
             attempt.error = f"could not start the Plaud CLI: {exc}"
             self._attempt = attempt
+            self._mirror_attempt(attempt)
             return attempt.snapshot()
 
         attempt.proc = proc
         self._attempt = attempt
+        self._mirror_attempt(attempt)  # visible cross-worker before the first stdout line lands
         threading.Thread(target=_reader, args=(proc, attempt), daemon=True).start()
         threading.Thread(target=_watchdog, args=(proc, attempt), daemon=True).start()
         return attempt.snapshot()
 
-    def status(self) -> dict:
-        if self._attempt is None:
+    async def status(self) -> dict:
+        """Always called directly from the async route (never threaded),
+        i.e. already on the loop ``ctx.state``'s client lives on — awaits
+        directly instead of going through the sync bridge above, which
+        would deadlock if used from this thread."""
+        if self._attempt is not None:
+            return self._attempt.snapshot()
+        record = await self.ctx.state.kv.get(_ATTEMPT_KV_NAME)
+        if record is None:
             return {"phase": "idle", "authorize_url": None, "seconds_remaining": 0, "error": None}
-        return self._attempt.snapshot()
+        return _public_snapshot(record.get("phase", "starting"), record.get("authorize_url"),
+                                 record.get("error"), record.get("started_at") or 0.0)
 
     def complete(self, callback_url: str) -> dict:
         """The one step only a human can do: paste the URL the browser
@@ -278,9 +444,16 @@ class CliLogin:
         copy) after authorizing. Extracts ``code``/``state`` and GETs the
         CLI's own callback server with them; the subprocess does the actual
         code exchange and writes the token file, this just waits for that
-        to land and copies the result into our own secret store."""
-        attempt = self._attempt
-        if attempt is None or attempt.snapshot()["phase"] not in ("waiting_for_browser", "timed_out"):
+        to land and copies the result into our own secret store.
+
+        Works the same whether this worker originated the attempt or not:
+        ``_current_snapshot()`` reads the local object when present and the
+        shared kv record otherwise. The callback GET below always reaches
+        the subprocess (shared network namespace, confirmed live 2026-10-27)
+        regardless of which worker issues it — only the snapshot lookup was
+        ever worker-local."""
+        snap = self._current_snapshot()
+        if snap["phase"] not in ("waiting_for_browser", "timed_out"):
             return {"ok": False, "error": "No connection attempt in progress — click Connect first."}
 
         parsed = urlparse(callback_url.strip())
@@ -311,12 +484,14 @@ class CliLogin:
 
         # The GET only kicks off the exchange server-side (see the CLI's
         # own oauth-callback-server.js) — give the subprocess a moment to
-        # finish it and print its outcome line.
+        # finish it and print its outcome line. Only the ORIGINATING
+        # worker's reader thread observes that line, so a non-originating
+        # worker has to poll the shared kv record instead of a local object.
         deadline = time.time() + COMPLETE_WAIT_S
-        snap = attempt.snapshot()
+        snap = self._current_snapshot()
         while time.time() < deadline and snap["phase"] not in ("connected", "timed_out", "error"):
             time.sleep(0.5)
-            snap = attempt.snapshot()
+            snap = self._current_snapshot()
         if snap["phase"] != "connected":
             return {
                 "ok": False,

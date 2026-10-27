@@ -243,7 +243,7 @@ def build_routes(ctx) -> FastAPI:
 
     @app.get("/cli/login/status")
     async def cli_login_status() -> dict:
-        return cli_login_mgr.status()
+        return await cli_login_mgr.status()
 
     @app.post("/cli/login/complete")
     async def cli_login_complete(data: dict = Body(...)) -> dict:

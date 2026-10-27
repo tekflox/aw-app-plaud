@@ -23,6 +23,7 @@
   "permissions": [
     "routes:register",
     "secrets:own",
+    "state:own",
     "ui:code"
   ],
   "contributes": {

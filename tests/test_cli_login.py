@@ -9,6 +9,7 @@ Run: python3 -m pytest tests/test_cli_login.py
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -19,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tests.test_routes import FakeCtx  # noqa: E402
+from tests.test_routes import FakeCtx, fake_worker_pair  # noqa: E402
 
 import plaud_app.cli_login as cli_login  # noqa: E402
 
@@ -174,7 +175,70 @@ def test_kill_terminates_the_whole_process_group():
 
 def test_status_reports_idle_before_any_attempt(tmp_path):
     mgr = cli_login.CliLogin(FakeCtx(package_dir=str(tmp_path)))
-    assert mgr.status() == {"phase": "idle", "authorize_url": None, "seconds_remaining": 0, "error": None}
+    assert asyncio.run(mgr.status()) == {
+        "phase": "idle", "authorize_url": None, "seconds_remaining": 0, "error": None}
+
+
+# ── cross-worker plumbing (ctx.state) — single-process proof; the real
+# cross-worker claim (two instances, one real Redis) is
+# tests/test_cli_login_multiworker.py ──────────────────────────────────────
+
+def test_start_does_not_spawn_when_another_worker_holds_the_lease(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(cli_login.subprocess, "Popen", lambda *a, **k: calls.append(1) or _FakeProc())
+
+    async def scenario():
+        ctx_a, ctx_b = fake_worker_pair(str(tmp_path))
+        ctx_a.state.lease.claim("cli-login")  # worker A already owns the live attempt
+        await ctx_a.state.kv.put("cli-login-attempt", {
+            "phase": "waiting_for_browser", "authorize_url": "https://web.plaud.ai/platform/oauth?x=1",
+            "error": None, "started_at": time.time(), "pid": 123,
+        }, ttl=60)
+
+        mgr_b = cli_login.CliLogin(ctx_b)  # a start() landing on a DIFFERENT worker
+        return await asyncio.to_thread(mgr_b.start)
+
+    result = asyncio.run(scenario())
+    assert calls == [], "a second start() must not race a live attempt into a port-8199 collision"
+    assert result["phase"] == "waiting_for_browser"
+    assert result["authorize_url"] == "https://web.plaud.ai/platform/oauth?x=1"
+
+
+def test_status_reads_the_kv_fallback_when_this_worker_has_no_local_attempt(tmp_path):
+    async def scenario():
+        ctx = FakeCtx(package_dir=str(tmp_path))
+        await ctx.state.kv.put("cli-login-attempt", {
+            "phase": "waiting_for_browser", "authorize_url": "https://web.plaud.ai/platform/oauth?x=2",
+            "error": None, "started_at": time.time(), "pid": 456,
+        }, ttl=60)
+        mgr = cli_login.CliLogin(ctx)  # never called start() itself — self._attempt is None
+        return await mgr.status()
+
+    result = asyncio.run(scenario())
+    assert result["phase"] == "waiting_for_browser"
+    assert result["authorize_url"] == "https://web.plaud.ai/platform/oauth?x=2"
+
+
+def test_start_kills_a_stale_attempt_left_by_a_different_worker_by_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    monkeypatch.setattr(cli_login.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    killed_pids = []
+    monkeypatch.setattr(cli_login, "_kill_by_pid", lambda pid: killed_pids.append(pid))
+
+    async def scenario():
+        ctx = FakeCtx(package_dir=str(tmp_path))
+        # A prior, now-resolved attempt (any worker) released the lease but
+        # may have left its subprocess lingering past its own terminal phase.
+        await ctx.state.kv.put("cli-login-attempt", {
+            "phase": "error", "authorize_url": None, "error": "boom",
+            "started_at": time.time(), "pid": 777,
+        }, ttl=60)
+        mgr = cli_login.CliLogin(ctx)
+        return await asyncio.to_thread(mgr.start)
+
+    asyncio.run(scenario())
+    assert killed_pids == [777]
 
 
 # ── CliLogin.complete() ───────────────────────────────────────────────────

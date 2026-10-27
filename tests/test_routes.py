@@ -42,11 +42,93 @@ class FakeSecrets:
         return list(self.store)
 
 
+class FakeKv:
+    """Stand-in for ``ctx.state.kv`` — in-memory, no TTL expiry, no Redis.
+    ``store`` is shared (not copied) across instances constructed with the
+    same dict, so two ``FakeCtx``'s can simulate two workers reading/writing
+    the one fact Redis would actually hold between them. Good enough for a
+    unit test; the real cross-worker claim is proven against a real Redis in
+    ``tests/test_cli_login_multiworker.py``, per
+    docs/standards/app-shared-state.md's testing section."""
+
+    def __init__(self, store=None):
+        self._data: dict[str, object] = store if store is not None else {}
+
+    async def put(self, name, value, ttl):
+        self._data[name] = value
+
+    async def get(self, name):
+        return self._data.get(name)
+
+    async def delete(self, name):
+        self._data.pop(name, None)
+
+    async def scan(self, prefix=""):
+        return [k for k in self._data if k.startswith(prefix)]
+
+
+class _SharedLeaseState:
+    """The fact a real flock'd file would hold: which names are CURRENTLY
+    taken, by anybody. Shared across ``FakeLease`` instances the same way a
+    real lock file is shared across ``_LeaseNamespace`` instances."""
+
+    def __init__(self):
+        self.taken: set[str] = set()
+
+
+class FakeLease:
+    """Stand-in for ``ctx.state.lease``. ``shared`` is a ``_SharedLeaseState``
+    two instances can both point at to simulate two workers contending for
+    the same name — mirrors the real flock-backed ``_LeaseNamespace``'s
+    "idempotent for the same holder, False for anyone else" contract."""
+
+    def __init__(self, shared=None):
+        self._shared = shared if shared is not None else _SharedLeaseState()
+        self._mine: set[str] = set()
+
+    def claim(self, name):
+        if name in self._mine:
+            return True
+        if name in self._shared.taken:
+            return False
+        self._shared.taken.add(name)
+        self._mine.add(name)
+        return True
+
+    def release(self, name):
+        if name in self._mine:
+            self._mine.discard(name)
+            self._shared.taken.discard(name)
+
+    def is_held(self, name):
+        return name in self._shared.taken
+
+
+class FakeState:
+    def __init__(self, shared_lease=None, shared_kv=None):
+        self.kv = FakeKv(store=shared_kv)
+        self.lease = FakeLease(shared=shared_lease)
+        self.degraded = False
+
+
 class FakeCtx:
-    def __init__(self, package_dir: str):
+    def __init__(self, package_dir: str, state=None):
         self.secrets = FakeSecrets()
+        self.state = state if state is not None else FakeState()
         self.config = {}
         self.package_dir = package_dir
+
+
+def fake_worker_pair(package_dir: str):
+    """Two ``FakeCtx``'s sharing one kv store and one lease table — a
+    single-process stand-in for "two workers" wherever a test needs real
+    lease contention (``FakeLease`` alone, used from one instance, cannot
+    model "someone else holds it": see ``_SharedLeaseState``)."""
+    shared_lease = _SharedLeaseState()
+    shared_kv: dict[str, object] = {}
+    ctx_a = FakeCtx(package_dir, state=FakeState(shared_lease=shared_lease, shared_kv=shared_kv))
+    ctx_b = FakeCtx(package_dir, state=FakeState(shared_lease=shared_lease, shared_kv=shared_kv))
+    return ctx_a, ctx_b
 
 
 def _client(tmp_path):
