@@ -62,3 +62,7 @@ temp/
 # `npm run build`, so a gitignored bundle means the installed app points at a
 # file that does not exist and its whole frontend silently vanishes.
 !ui/dist/
+
+# self_register.py writes this with a live X-Api-Key in plaintext —
+# never commit it (workspace-api-key-leak precedent).
+mcp.json
